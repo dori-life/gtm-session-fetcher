@@ -194,6 +194,28 @@ static NSDictionary *_Nullable GTMErrorUserInfoForData(NSData *_Nullable data,
 
 static GTMSessionFetcherTestBlock _Nullable gGlobalTestBlock;
 
+// Mori fork: storage for +setGlobalSessionConfigurationPolicy:. Guarded only by its own dedicated
+// lock object (not the class object, which other GTM code already uses for @synchronized).
+static GTMSessionFetcherSessionConfigurationPolicy _Nullable gGlobalSessionConfigurationPolicy;
+
+static NSObject *GTMSessionConfigurationPolicyLock(void) {
+  static NSObject *gLock;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    gLock = [[NSObject alloc] init];
+  });
+  return gLock;
+}
+
+// Returns a snapshot of the installed policy, taken under the policy-storage lock. Callers invoke
+// the returned block after this returns, i.e. outside the policy-storage lock.
+static GTMSessionFetcherSessionConfigurationPolicy _Nullable
+GTMSessionConfigurationPolicySnapshot(void) {
+  @synchronized(GTMSessionConfigurationPolicyLock()) {
+    return gGlobalSessionConfigurationPolicy;
+  }
+}
+
 @implementation GTMSessionFetcher {
   NSMutableURLRequest *_request;  // after beginFetch, changed only in delegate callbacks
   BOOL _useUploadTask;            // immutable after beginFetch
@@ -709,16 +731,36 @@ static GTMSessionFetcherTestBlock _Nullable gGlobalTestBlock;
 
   self.canShareSession = (_service != nil) && !isRecreatingSession && !self.usingBackgroundSession;
 
+  // Mori fork: set when the global session configuration policy refuses the session.
+  __block BOOL sessionConfigurationRejected = NO;
   if (!self.session) {
     if (self.canShareSession) {
       self.session = [_service
           sessionWithCreationBlock:^NSURLSession *(id<NSURLSessionDelegate> sessionDelegate) {
-            return [self createSessionWithDelegate:sessionDelegate
-                                 sessionIdentifier:priorSessionIdentifier];
+            BOOL rejected = NO;
+            NSURLSession *createdSession =
+                [self createSessionWithDelegate:sessionDelegate
+                              sessionIdentifier:priorSessionIdentifier
+                    rejectedByConfigurationPolicy:&rejected];
+            sessionConfigurationRejected = rejected;
+            return createdSession;
           }];
     } else {
-      self.session = [self createSessionWithDelegate:self sessionIdentifier:priorSessionIdentifier];
+      BOOL rejected = NO;
+      self.session = [self createSessionWithDelegate:self
+                                   sessionIdentifier:priorSessionIdentifier
+                       rejectedByConfigurationPolicy:&rejected];
+      sessionConfigurationRejected = rejected;
     }
+  }
+
+  if (sessionConfigurationRejected) {
+    // Mori fork: no session was created. Release anything the failed creation registered for a
+    // background session, then complete exactly once through the normal begin-failure path.
+    [self cleanUpBackgroundSessionAfterConfigurationRejection];
+    [self failToBeginFetchWithError:beginFailureError(
+                                        GTMSessionFetcherErrorSessionConfigurationRejected)];
+    return;
   }
 
   if (isRecreatingSession) {
@@ -1076,9 +1118,14 @@ static GTMSessionFetcherTestBlock _Nullable gGlobalTestBlock;
 // Helper method to create a new NSURLSession for this fetcher. Because the original
 // implementation had this code inline, marking direct to avoid any danger of subclasses
 // overriding the behavior.
-- (NSURLSession *)createSessionWithDelegate:(id<NSURLSessionDelegate>)sessionDelegate
-                          sessionIdentifier:(nullable NSString *)priorSessionIdentifier
+//
+// Mori fork: if the global session configuration policy refuses the configuration, no session is
+// created, nil is returned and *outRejected is set to YES.
+- (nullable NSURLSession *)createSessionWithDelegate:(id<NSURLSessionDelegate>)sessionDelegate
+                                   sessionIdentifier:(nullable NSString *)priorSessionIdentifier
+                       rejectedByConfigurationPolicy:(BOOL *)outRejected
     __attribute__((objc_direct)) {
+  *outRejected = NO;
   // Create a session.
   if (!_configuration) {
     if (priorSessionIdentifier || self.usingBackgroundSession) {
@@ -1114,6 +1161,14 @@ static GTMSessionFetcherTestBlock _Nullable gGlobalTestBlock;
     _configurationBlock(self, _configuration);
   }
 
+  // Mori fork: the policy sees the final configuration, after configurationBlock and right before
+  // the session is created. Snapshot under the policy lock, invoke outside it.
+  GTMSessionFetcherSessionConfigurationPolicy policy = GTMSessionConfigurationPolicySnapshot();
+  if (policy && !policy(_configuration)) {
+    *outRejected = YES;
+    return nil;
+  }
+
   id<NSURLSessionDelegate> delegate = sessionDelegate;
   if (!delegate || !self.canShareSession) {
     delegate = self;
@@ -1136,6 +1191,37 @@ static GTMSessionFetcherTestBlock _Nullable gGlobalTestBlock;
   }
 
   return session;
+}
+
+// Mori fork: undo what a refused session creation registered for a background session so nothing
+// is left behind: the persisted background-session entry, the system completion handler (called
+// once, since no session will ever deliver events for it), and the identifier-to-fetcher mapping.
+- (void)cleanUpBackgroundSessionAfterConfigurationRejection __attribute__((objc_direct)) {
+  if (self.sessionIdentifier == nil) {
+    return;
+  }
+
+  // Must run while the identifier is still mapped; it only removes mapped identifiers.
+  [self removePersistedBackgroundSessionFromDefaults];
+
+#if TARGET_OS_IPHONE
+  GTMSessionFetcherSystemCompletionHandler systemCompletionHandler;
+#endif
+  @synchronized(self) {
+    GTMSessionMonitorSynchronized(self);
+
+#if TARGET_OS_IPHONE
+    systemCompletionHandler = self.systemCompletionHandler;
+    self.systemCompletionHandler = nil;
+#endif
+    [self forgetSessionIdentifierForFetcher];
+  }  // @synchronized(self)
+
+#if TARGET_OS_IPHONE
+  if (systemCompletionHandler) {
+    dispatch_async(dispatch_get_main_queue(), systemCompletionHandler);
+  }
+#endif
 }
 
 // Asynchronously calculates the User-Agent header from |userAgentProvider|, then
@@ -2553,6 +2639,14 @@ NSData *_Nullable GTMDataFromInputStream(NSInputStream *inputStream, NSError **o
   GTMSESSION_ASSERT_DEBUG(block == nil, @"test blocks disabled");
 #endif
   gGlobalTestBlock = [block copy];
+}
+
++ (void)setGlobalSessionConfigurationPolicy:
+    (nullable GTMSessionFetcherSessionConfigurationPolicy)policy {
+  GTMSessionFetcherSessionConfigurationPolicy policyCopy = [policy copy];
+  @synchronized(GTMSessionConfigurationPolicyLock()) {
+    gGlobalSessionConfigurationPolicy = policyCopy;
+  }
 }
 
 #if GTM_BACKGROUND_TASK_FETCHING

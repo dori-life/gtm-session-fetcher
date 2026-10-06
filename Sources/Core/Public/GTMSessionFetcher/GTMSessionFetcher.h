@@ -438,6 +438,11 @@ typedef NS_ENUM(NSInteger, GTMSessionFetcherError) {
   // This error is only used if `stopFetchingTriggersCompletionHandler` is
   // enabled and `-stopFetching` is called on that fetcher.
   GTMSessionFetcherErrorUserCancelled = -7,
+
+  // Mori fork: the global session configuration policy (see
+  // `+setGlobalSessionConfigurationPolicy:`) returned NO, so no NSURLSession was created and the
+  // fetch did not begin.
+  GTMSessionFetcherErrorSessionConfigurationRejected = -8,
 };
 
 typedef NS_ENUM(NSInteger, GTMSessionFetcherStatus) {
@@ -462,6 +467,9 @@ extern "C" {
 typedef void (^GTMSessionFetcherConfigurationBlock)(GTMSessionFetcher *fetcher,
                                                     NSURLSessionConfiguration *configuration);
 typedef void (^GTMSessionFetcherSystemCompletionHandler)(void);
+// Mori fork: see `+[GTMSessionFetcher setGlobalSessionConfigurationPolicy:]`.
+typedef BOOL (^GTMSessionFetcherSessionConfigurationPolicy)(
+    NSURLSessionConfiguration *configuration);
 typedef void (^GTMSessionFetcherCompletionHandler)(NSData *_Nullable data,
                                                    NSError *_Nullable error);
 typedef NSURLSession *_Nullable (^GTMSessionFetcherSessionCreationBlock)(
@@ -1246,6 +1254,33 @@ __deprecated_msg("implement GTMSessionFetcherAuthorizer instead")
 @property(atomic, copy, nullable) GTMSessionFetcherTestBlock testBlock;
 
 + (void)setGlobalTestBlock:(nullable GTMSessionFetcherTestBlock)block;
+
+// Mori fork: process-wide session configuration policy.
+//
+// Called with the NSURLSessionConfiguration of every NSURLSession that GTMSessionFetcher creates
+// after this call returns, including background sessions and cold-restored background sessions
+// (fetchers re-created from a session identifier). It runs after the fetcher's / service's
+// configurationBlock and right before the NSURLSession is created, so it sees, and may modify,
+// the final configuration the session will be created with.
+//
+// Return NO to refuse: no session is created and the fetch completes exactly once with
+// kGTMSessionFetcherErrorDomain / GTMSessionFetcherErrorSessionConfigurationRejected through the
+// normal completion path. For a refused background session, the fetcher's background session
+// identifier mapping and persisted entry are removed, and any registered system completion handler
+// for that identifier is called once (on the main queue) and cleared.
+//
+// Sessions that already exist (including a fetcher service's shared session, which later fetchers
+// reuse without consulting the policy, and sessions held by the system) are not reconfigured.
+// Install once, before any fetcher or service is used.
+//
+// The block is copied. It is read under a dedicated policy-storage lock and invoked outside that
+// lock, but other GTM-internal locks (e.g. the fetcher service's session-creation lock and its
+// @synchronized monitor) may be held during the call, so the block must not call back into
+// GTMSessionFetcher or GTMSessionFetcherService.
+//
+// Passing nil removes the policy; with no policy installed, behavior is identical to upstream.
++ (void)setGlobalSessionConfigurationPolicy:
+    (nullable GTMSessionFetcherSessionConfigurationPolicy)policy;
 
 // When using the testBlock, |testBlockAccumulateDataChunkCount| is the desired number of chunks to
 // divide the response data into if the client has streaming enabled. The data will be divided up to
